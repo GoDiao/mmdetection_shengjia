@@ -12,15 +12,20 @@ from ..layers import (CdnQueryGenerator, DeformableDetrTransformerEncoder,
                       DinoTransformerDecoder, SinePositionalEncoding)
 from .deformable_detr import DeformableDETR, MultiScaleDeformableAttention
 '''
-type='DINOScaleAware',  # 使用我们的 Scale-Aware 版本
-    num_queries=900,  # 总 query 数量保持不变
-    with_box_refine=True,
-    as_two_stage=True,
-    
-    # ============ Scale-Aware 特定配置 ============
-    scale_ranges=((0, 32), (32, 96), (96, 1e5)),  # 小、中、大目标的尺度范围
-    query_scale_ratios=(0.5, 0.35, 0.15),  # 450 small, 315 medium, 135 large
-    # ============================================
+    model = dict(
+        type='DINOScaleAware',
+        num_queries=900,
+        
+        # ✅ 归一化尺度范围（相对于图像短边）
+        # 小目标：边长 < 4% 短边
+        # 中等目标：4% ~ 12% 短边
+        # 大目标：> 12% 短边
+        scale_ranges=((0.0, 0.04), (0.04, 0.12), (0.12, 1.0)),
+        
+        query_scale_ratios=(0.5, 0.35, 0.15),
+        default_img_shape=(800, 1333),  # 仅用于推理时的 fallback
+        # ...
+    )
 '''
 
 @MODELS.register_module()
@@ -44,8 +49,9 @@ class DINOScaleAware(DeformableDETR):
 
     def __init__(self, 
                  *args, 
-                 scale_ranges: tuple = ((0, 32), (32, 96), (96, 1e5)),
-                 query_scale_ratios: tuple = (0.5, 0.35, 0.15),
+                 scale_ranges=((0.0, 0.04), (0.04, 0.12), (0.12, 1.0)),  # 相对比例
+                 query_scale_ratios=(0.5, 0.35, 0.15),
+                 default_img_shape=(800, 1333),
                  dn_cfg: OptConfigType = None, 
                  **kwargs) -> None:
         self.scale_ranges = scale_ranges
@@ -150,53 +156,77 @@ class DINOScaleAware(DeformableDETR):
       batch_data_samples: OptSampleList = None,
       default_img_shape: tuple = (800, 1333)
   ) -> Tensor:
-      """计算 bbox 的面积（用于尺度分类）
-      
-      Args:
-          bboxes (Tensor): shape (bs, N, 4), format (cx, cy, w, h), normalized [0, 1]
-          batch_data_samples (list, optional): batch data samples with img_metas
-          default_img_shape (tuple): 默认图像尺寸，用于推理时的 fallback
-          
-      Returns:
-          Tensor: shape (bs, N), 边长（像素单位）
-      """
-      bs = bboxes.shape[0]
-      areas_list = []
-      
-      for b in range(bs):
-          # ============ 核心改进：兼容训练和推理 ============
-          if batch_data_samples is not None and len(batch_data_samples) > b:
-              # 尝试从 batch_data_samples 获取
-              metainfo = batch_data_samples[b].metainfo
-              if 'img_shape' in metainfo and metainfo['img_shape'] is not None:
-                  img_shape = metainfo['img_shape']
-                  img_h, img_w = img_shape[0], img_shape[1]
-              elif 'ori_shape' in metainfo and metainfo['ori_shape'] is not None:
-                  # Fallback: 使用原始图像尺寸
-                  ori_shape = metainfo['ori_shape']
-                  img_h, img_w = ori_shape[0], ori_shape[1]
-              else:
-                  # Fallback: 使用默认尺寸
-                  img_h, img_w = default_img_shape
-          else:
-              # 推理时没有 batch_data_samples，使用默认尺寸
-              img_h, img_w = default_img_shape
-          # ============ 改进结束 ============
-          
-          # 计算实际像素尺寸（bboxes 是 normalized 坐标）
-          widths = bboxes[b, :, 2] * img_w
-          heights = bboxes[b, :, 3] * img_h
-          areas = (widths * heights).sqrt()  # 返回边长
-          areas_list.append(areas)
-      
-      return torch.stack(areas_list, dim=0)  # (bs, N)
-
+        """计算 bbox 的边长（支持 2D 和 3D 输入）"""
+        # 统一处理维度
+        if bboxes.dim() == 2:
+            bboxes = bboxes.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+        
+        bs = bboxes.shape[0]
+        areas_list = []
+        
+        for b in range(bs):
+            # 获取图像尺寸
+            if batch_data_samples and len(batch_data_samples) > b:
+                metainfo = batch_data_samples[b].metainfo
+                img_h = metainfo.get('img_shape', self.default_img_shape)[0]
+                img_w = metainfo.get('img_shape', self.default_img_shape)[1]
+            else:
+                img_h, img_w = self.default_img_shape
+            
+            # 计算边长（从 normalized 坐标转换）
+            widths = bboxes[b, :, 2] * img_w
+            heights = bboxes[b, :, 3] * img_h
+            areas = (widths * heights).sqrt().clamp(min=1e-6)
+            areas_list.append(areas)
+        
+        result = torch.stack(areas_list, dim=0)
+        return result.squeeze(0) if squeeze_output else result
+    
+    def _compute_bbox_areas_normalized(
+        self, 
+        bboxes: Tensor,
+        batch_data_samples: OptSampleList = None
+    ) -> Tensor:
+        """计算归一化的 bbox 边长（相对于图像短边）"""
+        if bboxes.dim() == 2:
+            bboxes = bboxes.unsqueeze(0)
+            squeeze_output = True
+        else:
+            squeeze_output = False
+        
+        bs = bboxes.shape[0]
+        areas_list = []
+        
+        for b in range(bs):
+            # 获取图像尺寸
+            if batch_data_samples and len(batch_data_samples) > b:
+                metainfo = batch_data_samples[b].metainfo
+                img_h = metainfo.get('img_shape', self.default_img_shape)[0]
+                img_w = metainfo.get('img_shape', self.default_img_shape)[1]
+            else:
+                img_h, img_w = self.default_img_shape
+            
+            # ✅ 关键：归一化到短边
+            min_size = min(img_h, img_w)
+            
+            # 计算归一化边长
+            widths = bboxes[b, :, 2] * img_w / min_size
+            heights = bboxes[b, :, 3] * img_h / min_size
+            areas = (widths * heights).sqrt().clamp(min=1e-6)
+            areas_list.append(areas)
+        
+        result = torch.stack(areas_list, dim=0)
+        return result.squeeze(0) if squeeze_output else result
 
     def _scale_aware_topk_selection(
         self,
         enc_outputs_class: Tensor,
         enc_outputs_coord: Tensor,
-        batch_size: int
+        batch_size: int,
+        batch_data_samples: OptSampleList = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """尺度感知的 top-k 选择策略
         
@@ -224,48 +254,44 @@ class DINOScaleAware(DeformableDETR):
             class_b = enc_outputs_class[b]  # (num_proposals, num_classes)
             
             # 计算每个 proposal 的尺度
-            areas = self._compute_bbox_areas(coords_b)  # (num_proposals,)
+            areas = self._compute_bbox_areas_normalized(
+                coords_b, 
+                batch_data_samples[b:b+1] if batch_data_samples else None
+            )
             
-            # 分类到不同尺度
-            small_mask = (areas >= self.scale_ranges[0][0]) & (areas < self.scale_ranges[0][1])
-            medium_mask = (areas >= self.scale_ranges[1][0]) & (areas < self.scale_ranges[1][1])
-            large_mask = areas >= self.scale_ranges[2][0]
+            # ✅ 使用归一化的尺度范围
+            valid_mask = torch.isfinite(areas) & (areas > 0)
+            small_mask = valid_mask & (areas >= self.scale_ranges[0][0]) & (areas < self.scale_ranges[0][1])
+            medium_mask = valid_mask & (areas >= self.scale_ranges[1][0]) & (areas < self.scale_ranges[1][1])
+            large_mask = valid_mask & (areas >= self.scale_ranges[2][0])
             
-            # 从每个尺度选择 top-k
-            def select_topk_by_mask(mask, k):
+            # ✅ 修复：避免重复选择
+            def safe_topk(mask, k, exclude_indices=None):
                 masked_scores = scores_b.clone()
-                masked_scores[~mask] = -1e10  # 屏蔽其他尺度
-                if mask.sum() < k:
-                    # 如果该尺度的 proposals 不足，从所有 proposals 中补充
-                    k_actual = mask.sum()
-                    topk_vals, topk_inds = torch.topk(masked_scores, k=k_actual.item())
-                    # 补充剩余的
-                    remaining = k - k_actual.item()
-                    if remaining > 0:
-                        remaining_scores = scores_b.clone()
-                        remaining_scores[mask] = -1e10
-                        topk_vals_remain, topk_inds_remain = torch.topk(
-                            remaining_scores, k=remaining)
-                        topk_vals = torch.cat([topk_vals, topk_vals_remain])
-                        topk_inds = torch.cat([topk_inds, topk_inds_remain])
-                else:
-                    topk_vals, topk_inds = torch.topk(masked_scores, k=k)
-                return topk_inds
+                masked_scores[~mask] = -1e10
+                if exclude_indices is not None and len(exclude_indices) > 0:
+                    masked_scores[exclude_indices] = -1e10
+                
+                available = (masked_scores > -1e9).sum().item()
+                k_actual = min(k, available, len(masked_scores))
+                
+                if k_actual > 0:
+                    return torch.topk(masked_scores, k=k_actual)[1]
+                return torch.tensor([], dtype=torch.long, device=scores_b.device)
             
-            small_indices = select_topk_by_mask(small_mask, self.num_small_queries)
-            medium_indices = select_topk_by_mask(medium_mask, self.num_medium_queries)
-            large_indices = select_topk_by_mask(large_mask, self.num_large_queries)
+            selected = []
+            for mask, num_q in [(small_mask, self.num_small_queries),
+                                (medium_mask, self.num_medium_queries),
+                                (large_mask, self.num_large_queries)]:
+                indices = safe_topk(mask, num_q, 
+                                   torch.cat(selected) if selected else None)
+                selected.append(indices)
             
-            # 合并索引
-            topk_indices_b = torch.cat([small_indices, medium_indices, large_indices])
+            topk_indices_b = torch.cat(selected)
             
-            # 收集对应的 scores 和 coords
-            topk_scores_b = torch.gather(
-                class_b, 0,
-                topk_indices_b.unsqueeze(-1).repeat(1, cls_out_features))
-            topk_coords_b = torch.gather(
-                coords_b, 0,
-                topk_indices_b.unsqueeze(-1).repeat(1, 4))
+            # 收集结果
+            topk_scores_b = class_b[topk_indices_b]
+            topk_coords_b = coords_b[topk_indices_b]
             
             all_topk_indices.append(topk_indices_b)
             all_topk_scores.append(topk_scores_b)
@@ -299,7 +325,7 @@ class DINOScaleAware(DeformableDETR):
         # ============ 核心改动：尺度感知的 top-k 选择 ============
         topk_indices, topk_score, topk_coords_unact = \
             self._scale_aware_topk_selection(
-                enc_outputs_class, enc_outputs_coord_unact, bs)
+                enc_outputs_class, enc_outputs_coord_unact, bs, batch_data_samples=batch_data_samples)
         # ============ 改动结束 ============
         
         topk_coords = topk_coords_unact.sigmoid()
