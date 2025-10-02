@@ -11,7 +11,17 @@ from mmdet.utils import OptConfigType
 from ..layers import (CdnQueryGenerator, DeformableDetrTransformerEncoder,
                       DinoTransformerDecoder, SinePositionalEncoding)
 from .deformable_detr import DeformableDETR, MultiScaleDeformableAttention
-
+'''
+type='DINOScaleAware',  # 使用我们的 Scale-Aware 版本
+    num_queries=900,  # 总 query 数量保持不变
+    with_box_refine=True,
+    as_two_stage=True,
+    
+    # ============ Scale-Aware 特定配置 ============
+    scale_ranges=((0, 32), (32, 96), (96, 1e5)),  # 小、中、大目标的尺度范围
+    query_scale_ratios=(0.5, 0.35, 0.15),  # 450 small, 315 medium, 135 large
+    # ============================================
+'''
 
 @MODELS.register_module()
 class DINOScaleAware(DeformableDETR):
