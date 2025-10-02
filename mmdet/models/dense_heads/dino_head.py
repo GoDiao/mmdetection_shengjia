@@ -477,3 +477,47 @@ class DINOHead(DeformableDETRHead):
         return (all_layers_matching_cls_scores, all_layers_matching_bbox_preds,
                 all_layers_denoising_cls_scores,
                 all_layers_denoising_bbox_preds)
+
+# 在 dino_head.py 的 DINOHead 类中添加
+
+@MODELS.register_module()
+class DINOHeadScaleAware(DINOHead):
+    """Scale-Aware DINO Head with scale-specific loss weights."""
+    
+    def __init__(self, 
+                 *args,
+                 scale_ranges: tuple = ((0, 32), (32, 96), (96, 1e5)),
+                 scale_loss_weights: tuple = (2.0, 1.0, 0.5),  # 小目标权重更大
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scale_ranges = scale_ranges
+        self.scale_loss_weights = scale_loss_weights
+    
+    def _get_scale_weight(self, bboxes: Tensor, img_meta: dict) -> Tensor:
+        """根据 bbox 尺度计算 loss 权重
+        
+        Args:
+            bboxes (Tensor): shape (N, 4), format (x1, y1, x2, y2)
+            img_meta (dict): 图像元信息
+            
+        Returns:
+            Tensor: shape (N,), loss 权重
+        """
+        img_h, img_w = img_meta['img_shape']
+        
+        # 计算面积
+        widths = (bboxes[:, 2] - bboxes[:, 0]) * img_w
+        heights = (bboxes[:, 3] - bboxes[:, 1]) * img_h
+        areas = (widths * heights).sqrt()  # 使用边长
+        
+        # 分配权重
+        weights = torch.ones_like(areas)
+        small_mask = (areas >= self.scale_ranges[0][0]) & (areas < self.scale_ranges[0][1])
+        medium_mask = (areas >= self.scale_ranges[1][0]) & (areas < self.scale_ranges[1][1])
+        large_mask = areas >= self.scale_ranges[2][0]
+        
+        weights[small_mask] = self.scale_loss_weights[0]
+        weights[medium_mask] = self.scale_loss_weights[1]
+        weights[large_mask] = self.scale_loss_weights[2]
+        
+        return weights
