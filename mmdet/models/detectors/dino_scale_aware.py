@@ -134,20 +134,53 @@ class DINOScaleAware(DeformableDETR):
         head_inputs_dict.update(decoder_outputs_dict)
         return head_inputs_dict
 
-    def _compute_bbox_areas(self, bboxes: Tensor) -> Tensor:
-        """计算 bbox 的面积（用于尺度分类）
-        
-        Args:
-            bboxes (Tensor): shape (N, 4), format (cx, cy, w, h), normalized
-            
-        Returns:
-            Tensor: shape (N,), 面积（像素单位）
-        """
-        # 假设输入图像大小为 800x1333（COCO 标准）
-        # 实际应该从 batch_data_samples 中获取
-        img_h, img_w = 800, 1333
-        areas = bboxes[:, 2] * bboxes[:, 3] * img_h * img_w
-        return areas.sqrt()  # 返回边长（更直观）
+    def _compute_bbox_areas(
+      self, 
+      bboxes: Tensor, 
+      batch_data_samples: OptSampleList = None,
+      default_img_shape: tuple = (800, 1333)
+  ) -> Tensor:
+      """计算 bbox 的面积（用于尺度分类）
+      
+      Args:
+          bboxes (Tensor): shape (bs, N, 4), format (cx, cy, w, h), normalized [0, 1]
+          batch_data_samples (list, optional): batch data samples with img_metas
+          default_img_shape (tuple): 默认图像尺寸，用于推理时的 fallback
+          
+      Returns:
+          Tensor: shape (bs, N), 边长（像素单位）
+      """
+      bs = bboxes.shape[0]
+      areas_list = []
+      
+      for b in range(bs):
+          # ============ 核心改进：兼容训练和推理 ============
+          if batch_data_samples is not None and len(batch_data_samples) > b:
+              # 尝试从 batch_data_samples 获取
+              metainfo = batch_data_samples[b].metainfo
+              if 'img_shape' in metainfo and metainfo['img_shape'] is not None:
+                  img_shape = metainfo['img_shape']
+                  img_h, img_w = img_shape[0], img_shape[1]
+              elif 'ori_shape' in metainfo and metainfo['ori_shape'] is not None:
+                  # Fallback: 使用原始图像尺寸
+                  ori_shape = metainfo['ori_shape']
+                  img_h, img_w = ori_shape[0], ori_shape[1]
+              else:
+                  # Fallback: 使用默认尺寸
+                  img_h, img_w = default_img_shape
+          else:
+              # 推理时没有 batch_data_samples，使用默认尺寸
+              img_h, img_w = default_img_shape
+          # ============ 改进结束 ============
+          
+          # 计算实际像素尺寸（bboxes 是 normalized 坐标）
+          widths = bboxes[b, :, 2] * img_w
+          heights = bboxes[b, :, 3] * img_h
+          areas = (widths * heights).sqrt()  # 返回边长
+          areas_list.append(areas)
+      
+      return torch.stack(areas_list, dim=0)  # (bs, N)
+
 
     def _scale_aware_topk_selection(
         self,
