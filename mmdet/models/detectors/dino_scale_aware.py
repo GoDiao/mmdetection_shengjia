@@ -13,6 +13,9 @@ from ..layers import (CdnQueryGenerator, DeformableDetrTransformerEncoder,
 from .deformable_detr import DeformableDETR, MultiScaleDeformableAttention
 '''
 https://monica.im/share/chat?shareId=r44FnEXHICr1c0Sy
+【视觉语言行动模型研究 - Monica AI Chat】https://monica.im/share/chat?shareId=bWTfEP0xcyp0Bmch
+
+
     model = dict(
         type='DINOScaleAware',
         num_queries=900,
