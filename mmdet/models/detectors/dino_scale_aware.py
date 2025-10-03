@@ -20,16 +20,18 @@ https://monica.im/share/chat?shareId=r44FnEXHICr1c0Sy
         type='DINOScaleAware',
         num_queries=900,
         
-        # ✅ 归一化尺度范围（相对于图像短边）
-        # 小目标：边长 < 4% 短边
-        # 中等目标：4% ~ 12% 短边
-        # 大目标：> 12% 短边
-        scale_ranges=((0.0, 0.04), (0.04, 0.12), (0.12, 1.0)),
+        # 尺度范围保持不变
+        scale_ranges=(
+            (0.0, 0.0246),      # Small
+            (0.0246, 0.0853),   # Medium
+            (0.0853, 1.0)       # Large
+        ),
         
-        query_scale_ratios=(0.5, 0.35, 0.15),
-        default_img_shape=(800, 1333),  # 仅用于推理时的 fallback
-        # ...
-    )
+        # 向小目标倾斜：Small 40%, Medium 35%, Large 25%
+        query_scale_ratios=(0.40, 0.35, 0.25),
+        # 对应：360, 315, 225 个 query
+            # ...
+        )
 '''
 
 @MODELS.register_module()
