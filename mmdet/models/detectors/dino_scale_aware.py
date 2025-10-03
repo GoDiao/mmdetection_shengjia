@@ -538,6 +538,28 @@ class DINOScaleAwarenQ(DeformableDETR):
             Default: (0.5, 0.35, 0.15) for (small, medium, large)
         dn_cfg (:obj:`ConfigDict` or dict, optional): Config of denoising
             query generator. Defaults to `None`.
+
+
+    model = dict(
+    type='DINOScaleAware',
+    num_queries=900,
+    
+    # 尺度范围
+    scale_ranges=(
+        (0.0, 0.0246),      # Small
+        (0.0246, 0.0853),   # Medium
+        (0.0853, 1.0)       # Large
+    ),
+    
+    # Query 分配比例（向小目标倾斜）
+    query_scale_ratios=(0.40, 0.35, 0.25),
+    # 对应：360, 315, 225 个 query
+    
+    # 默认图像尺寸
+    default_img_shape=(800, 1333),
+    
+    # 不从预训练加载 query（推荐）
+    load_query_from_pretrain=False,
     """
 
     def __init__(self, 
