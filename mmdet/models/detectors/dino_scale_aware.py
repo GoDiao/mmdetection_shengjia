@@ -125,14 +125,22 @@ class DINOScaleAware(DeformableDETR):
         nn.init.xavier_uniform_(self.memory_trans_fc.weight)
         
         # ============ 核心改动：尺度特定的初始化 ============
-        # 小目标：更小的初始化方差，更密集的特征
-        nn.init.normal_(self.small_query_embed.weight, std=0.01)
+        # 小目标 (40% query, 360个)
+        # - 更小的方差 → 更密集的初始分布
+        # - 更精细的特征表达
+        self.small_query_embed = nn.Embedding(num_small, self.embed_dims)
+        nn.init.normal_(self.small_query_embed.weight, std=0.008)
         
-        # 中等目标：标准初始化
-        nn.init.normal_(self.medium_query_embed.weight, std=0.02)
+        # 中等目标 (35% query, 315个)
+        # - 中等方差 → 平衡覆盖范围和精度
+        self.medium_query_embed = nn.Embedding(num_medium, self.embed_dims)
+        nn.init.normal_(self.medium_query_embed.weight, std=0.015)
         
-        # 大目标：更大的初始化方差，更稀疏的特征
-        nn.init.normal_(self.large_query_embed.weight, std=0.05)
+        # 大目标 (25% query, 225个)
+        # - 更大的方差 → 更稀疏但覆盖更广
+        # - 用更少的 query 覆盖更大的空间
+        self.large_query_embed = nn.Embedding(num_large, self.embed_dims)
+        nn.init.normal_(self.large_query_embed.weight, std=0.06) 
         # ============ 改动结束 ============
         
         normal_(self.level_embed)
