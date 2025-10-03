@@ -12,6 +12,7 @@ from ..layers import (CdnQueryGenerator, DeformableDetrTransformerEncoder,
                       DinoTransformerDecoder, SinePositionalEncoding)
 from .deformable_detr import DeformableDETR, MultiScaleDeformableAttention
 '''
+https://monica.im/share/chat?shareId=r44FnEXHICr1c0Sy
     model = dict(
         type='DINOScaleAware',
         num_queries=900,
