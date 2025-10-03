@@ -191,7 +191,12 @@ class DINOScaleAware(DeformableDETR):
         bboxes: Tensor,
         batch_data_samples: OptSampleList = None
     ) -> Tensor:
-        """计算归一化的 bbox 边长（相对于图像短边）"""
+        """计算归一化的 bbox 边长（相对于图像短边）
+        
+        Returns:
+            Tensor: 边长比例，范围约 [0, 1.4]
+                    例如 0.05 表示边长是短边的 5%
+        """
         if bboxes.dim() == 2:
             bboxes = bboxes.unsqueeze(0)
             squeeze_output = True
@@ -210,17 +215,25 @@ class DINOScaleAware(DeformableDETR):
             else:
                 img_h, img_w = self.default_img_shape
             
-            # ✅ 关键：归一化到短边
             min_size = min(img_h, img_w)
             
-            # 计算归一化边长
-            widths = bboxes[b, :, 2] * img_w / min_size
-            heights = bboxes[b, :, 3] * img_h / min_size
-            areas = (widths * heights).sqrt().clamp(min=1e-6)
-            areas_list.append(areas)
+            # ✅ 正确的计算方式
+            # bboxes[b, :, 2/3] 已经是 normalized (0-1)
+            # 需要转换为相对于短边的比例
+            widths_pixel = bboxes[b, :, 2] * img_w    # 像素宽度
+            heights_pixel = bboxes[b, :, 3] * img_h   # 像素高度
+            
+            # 边长（几何平均）
+            side_length_pixel = (widths_pixel * heights_pixel).sqrt()
+            
+            # 归一化到短边
+            side_length_normalized = side_length_pixel / min_size
+            
+            areas_list.append(side_length_normalized.clamp(min=1e-6))
         
         result = torch.stack(areas_list, dim=0)
         return result.squeeze(0) if squeeze_output else result
+
 
     def _scale_aware_topk_selection(
         self,
@@ -228,7 +241,7 @@ class DINOScaleAware(DeformableDETR):
         enc_outputs_coord: Tensor,
         batch_size: int,
         batch_data_samples: OptSampleList = None,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """尺度感知的 top-k 选择策略
         
         Args:
@@ -248,6 +261,7 @@ class DINOScaleAware(DeformableDETR):
         all_topk_indices = []
         all_topk_scores = []
         all_topk_coords = []
+        all_scale_labels = [] #用于记录query的尺度
         
         for b in range(batch_size):
             scores_b = proposal_scores[b]  # (num_proposals,)
@@ -260,13 +274,42 @@ class DINOScaleAware(DeformableDETR):
                 batch_data_samples[b:b+1] if batch_data_samples else None
             )
             
-            # ✅ 使用归一化的尺度范围
-            valid_mask = torch.isfinite(areas) & (areas > 0)
-            small_mask = valid_mask & (areas >= self.scale_ranges[0][0]) & (areas < self.scale_ranges[0][1])
-            medium_mask = valid_mask & (areas >= self.scale_ranges[1][0]) & (areas < self.scale_ranges[1][1])
-            large_mask = valid_mask & (areas >= self.scale_ranges[2][0])
+            # ✅ 严格的尺度划分（避免重叠）
+            valid_mask = torch.isfinite(areas) & (areas > 0) & (areas < 2.0)  # 过滤异常值
             
-            # ✅ 修复：避免重复选择
+            small_mask = valid_mask & (areas < self.scale_ranges[0][1])
+            medium_mask = valid_mask & (areas >= self.scale_ranges[1][0]) & (areas < self.scale_ranges[1][1])
+            large_mask = valid_mask & (areas >= self.scale_ranges[2][0]) & (areas < 2.0)
+            
+            # ✅ 动态调整 query 数量（如果某个尺度的 proposal 不足）
+            num_small_available = small_mask.sum().item()
+            num_medium_available = medium_mask.sum().item()
+            num_large_available = large_mask.sum().item()
+            
+            # 如果某个尺度不足，将多余的 quota 分配给其他尺度
+            num_small_actual = min(self.num_small_queries, num_small_available)
+            num_medium_actual = min(self.num_medium_queries, num_medium_available)
+            num_large_actual = min(self.num_large_queries, num_large_available)
+            
+            # 计算剩余 quota
+            remaining = self.num_queries - (num_small_actual + num_medium_actual + num_large_actual)
+            
+            # 按比例分配剩余 quota
+            if remaining > 0:
+                if num_small_available > num_small_actual:
+                    extra_small = min(remaining, num_small_available - num_small_actual)
+                    num_small_actual += extra_small
+                    remaining -= extra_small
+                
+                if remaining > 0 and num_medium_available > num_medium_actual:
+                    extra_medium = min(remaining, num_medium_available - num_medium_actual)
+                    num_medium_actual += extra_medium
+                    remaining -= extra_medium
+                
+                if remaining > 0 and num_large_available > num_large_actual:
+                    num_large_actual += remaining
+            
+            # ✅ 选择 top-k
             def safe_topk(mask, k, exclude_indices=None):
                 masked_scores = scores_b.clone()
                 masked_scores[~mask] = -1e10
@@ -281,15 +324,40 @@ class DINOScaleAware(DeformableDETR):
                 return torch.tensor([], dtype=torch.long, device=scores_b.device)
             
             selected = []
-            for mask, num_q in [(small_mask, self.num_small_queries),
-                                (medium_mask, self.num_medium_queries),
-                                (large_mask, self.num_large_queries)]:
+            scale_labels = []  # ✅ 记录每个 query 的尺度
+            for scale_id, (mask, num_q) in enumerate([
+                                                    (small_mask, self.num_small_queries),
+                                                    (medium_mask, self.num_medium_queries),
+                                                    (large_mask, self.num_large_queries)
+                                                ]):
                 indices = safe_topk(mask, num_q, 
                                    torch.cat(selected) if selected else None)
                 selected.append(indices)
+                scale_labels.append(
+                    torch.full((len(indices),), scale_id, 
+                              dtype=torch.long, device=indices.device)
+                )
             
             topk_indices_b = torch.cat(selected)
+            scale_labels_b = torch.cat(scale_labels) 
             
+            # ✅ 如果总数不足 num_queries，用全局 top-k 补充
+            if len(topk_indices_b) < self.num_queries:
+                remaining_needed = self.num_queries - len(topk_indices_b)
+                masked_scores = scores_b.clone()
+                masked_scores[topk_indices_b] = -1e10
+                extra_indices = torch.topk(masked_scores, k=remaining_needed)[1]
+                topk_indices_b = torch.cat([topk_indices_b, extra_indices])
+                # ✅ 为补充的 query 分配尺度标签（根据实际尺度）
+                extra_areas = areas[extra_indices]
+                extra_scale_labels = torch.zeros(remaining_needed, dtype=torch.long, device=areas.device)
+                extra_scale_labels[extra_areas < self.scale_ranges[0][1]] = 0  # small
+                extra_scale_labels[(extra_areas >= self.scale_ranges[1][0]) & 
+                                   (extra_areas < self.scale_ranges[1][1])] = 1  # medium
+                extra_scale_labels[extra_areas >= self.scale_ranges[2][0]] = 2  # large
+                
+                scale_labels_b = torch.cat([scale_labels_b, extra_scale_labels])
+
             # 收集结果
             topk_scores_b = class_b[topk_indices_b]
             topk_coords_b = coords_b[topk_indices_b]
@@ -297,12 +365,14 @@ class DINOScaleAware(DeformableDETR):
             all_topk_indices.append(topk_indices_b)
             all_topk_scores.append(topk_scores_b)
             all_topk_coords.append(topk_coords_b)
+            all_scale_labels.append(scale_labels_b)
         
         topk_indices = torch.stack(all_topk_indices, dim=0)  # (bs, num_queries)
         topk_scores = torch.stack(all_topk_scores, dim=0)    # (bs, num_queries, num_classes)
         topk_coords = torch.stack(all_topk_coords, dim=0)    # (bs, num_queries, 4)
-        
-        return topk_indices, topk_scores, topk_coords
+        scale_labels = torch.stack(all_scale_labels, dim=0)
+
+        return topk_indices, topk_scores, topk_coords, scale_labels
 
     def pre_decoder(
         self,
@@ -324,9 +394,17 @@ class DINOScaleAware(DeformableDETR):
             self.decoder.num_layers](output_memory) + output_proposals
 
         # ============ 核心改动：尺度感知的 top-k 选择 ============
-        topk_indices, topk_score, topk_coords_unact = \
+        topk_indices, topk_score, topk_coords_unact, scale_labels = \
             self._scale_aware_topk_selection(
                 enc_outputs_class, enc_outputs_coord_unact, bs, batch_data_samples=batch_data_samples)
+
+        #检查断言
+        assert topk_indices.shape == (bs, self.num_queries), \
+            f"topk_indices shape mismatch: {topk_indices.shape} vs ({bs}, {self.num_queries})"
+        assert scale_labels.shape == (bs, self.num_queries), \
+            f"scale_labels shape mismatch: {scale_labels.shape} vs ({bs}, {self.num_queries})"
+        assert (scale_labels >= 0).all() and (scale_labels <= 2).all(), \
+            f"scale_labels out of range: {scale_labels.min()} ~ {scale_labels.max()}"
         # ============ 改动结束 ============
         
         topk_coords = topk_coords_unact.sigmoid()
@@ -338,8 +416,42 @@ class DINOScaleAware(DeformableDETR):
         medium_query = self.medium_query_embed.weight  # (num_medium, dim)
         large_query = self.large_query_embed.weight    # (num_large, dim)
         
-        query_embed = torch.cat([small_query, medium_query, large_query], dim=0)  # (num_queries, dim)
-        query = query_embed[:, None, :].repeat(1, bs, 1).transpose(0, 1)  # (bs, num_queries, dim)
+        all_query_embeds = torch.cat([small_query, medium_query, large_query], dim=0)  # (num_queries, dim)
+
+        # 为每个 batch 根据 scale_labels 选择对应的 embedding
+        query_list = []
+        for b in range(bs):
+            scale_labels_b = scale_labels[b]  # (num_queries,)
+            
+            # 计算每个 query 在 all_query_embeds 中的索引
+            indices_in_embed = torch.zeros_like(scale_labels_b)
+            
+            # Small queries: 索引 0 ~ num_small-1
+            small_mask = (scale_labels_b == 0)
+            small_count = small_mask.sum()
+            indices_in_embed[small_mask] = torch.arange(
+                small_count, device=scale_labels_b.device
+            )
+            
+            # Medium queries: 索引 num_small ~ num_small+num_medium-1
+            medium_mask = (scale_labels_b == 1)
+            medium_count = medium_mask.sum()
+            indices_in_embed[medium_mask] = torch.arange(
+                medium_count, device=scale_labels_b.device
+            ) + self.num_small_queries
+            
+            # Large queries: 索引 num_small+num_medium ~ end
+            large_mask = (scale_labels_b == 2)
+            large_count = large_mask.sum()
+            indices_in_embed[large_mask] = torch.arange(
+                large_count, device=scale_labels_b.device
+            ) + self.num_small_queries + self.num_medium_queries
+            
+            # 选择对应的 embedding
+            query_b = all_query_embeds[indices_in_embed]  # (num_queries, dim)
+            query_list.append(query_b)
+        
+        query = torch.stack(query_list, dim=0)  # (bs, num_queries, dim)
         # ============ 改动结束 ============
         
         if self.training:
